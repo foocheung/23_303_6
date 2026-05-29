@@ -1,0 +1,1094 @@
+---
+title: "303-6: Dengue Single-Cell Multiomics Analysis"
+subtitle: "GEX + ADT + VDJ Analysis of PBMC and Antigen-Sorted B Cells"
+author: "Foo"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    theme: flatly
+    embed-resources: true
+    fig-width: 10
+    fig-height: 6
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+---
+
+# Overview
+
+This report addresses analytical questions from the **303-6 study**, which uses
+10x Genomics single-cell multiomics (Gene Expression, CITE-seq antibody tags, and
+V(D)J sequencing) to characterise immune responses in dengue virus (DENV) infection.
+
+| Capture lanes | Data type | Questions |
+|---|---|---|
+| 1 – 5 | PBMC (whole blood mononuclear cells) | Q1, Q2, Q3 |
+| 6 – 7 | Antigen-sorted B cells (Ag+ / Ag−) | Q4, Q5, Q6 |
+
+---
+
+## QC and demultiplex 7 subjects using bulk RNA-seq reference
+
+## PBMC with Visc/CITE-seq (capture lanes 1-5)
+
+- Use GEX and ADT to identify cell populations that can be detected for each of the 7 subjects separately  
+
+- Use GEX to identify any DENV-infected cells, describing the cell types, and the number of infected cells/sample
+
+- Use VDJ to demonstrate BCR sequences can be determined for B cells from each subject
+
+## Ag pos and Ag neg sorted cells (capture lanes 6+7)
+- For the Ag pos sort use feature barcodes to identify cells specific to each of the antigens DV1-4, by per-cell comparisons to HSA antigen, for each of the 7 subjects separately 
+
+- Combine cells identified as binding any DV antigen from the Ag pos sort, use GEX to identify frequencies of B cell sub-populations, and compare these to their frequencies in the Ag neg sort for each of the 7 subjects separately
+
+- Combine cells identified to bind any DV antigen from the Ag pos sort, use VDJ to identify the most frequent BCR sequences, and compare these to their frequencies in the Ag neg sort for each of the 7 subjects separately 
+
+## With these we will identify next analysis steps with the collaborator, such as any DE comparisons to focus on
+
+---
+
+# Setup
+
+## Load libraries
+
+```{r}
+#| label: setup-libs
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tidyr)
+  library(scales)
+  library(readr)
+  library(stringr)
+  library(purrr)
+  library(ggrepel)      # label repulsion used in several plots
+  library(tibble)
+  library(knitr)
+})
+
+options(Seurat.object.assay.version = "v3")
+```
+
+## Output directories
+
+```{r}
+#| label: setup-dirs
+
+for (d in c("PBMC_figures", "AG_figures", "VDJ_figures",
+            "DENV_figures", "combined_figures")) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+```
+
+## Helper functions
+
+```{r}
+#| label: setup-helpers
+
+# ── File I/O ──────────────────────────────────────────────────────────────────
+
+save_plot <- function(plot, path, width = 10, height = 6, dpi = 300) {
+  ggsave(path, plot = plot, width = width, height = height,
+         dpi = dpi, limitsize = FALSE)
+  message("Saved: ", path)
+}
+
+vdj_b_files <- Sys.glob("./DATA/multi_config_[1-5]_filtered_contig_annotations.csv")
+
+
+require_file <- function(path) {
+  if (!file.exists(path))
+    stop("Missing required file: ", path,
+         "\nCheck getwd() and list.files(pattern = 'rds|tsv|csv')")
+  invisible(path)
+}
+
+save_table <- function(x, path) {
+  readr::write_csv(x, path)
+  message("Saved: ", path)
+}
+
+# ── Seurat v4/v5-safe assay accessor ─────────────────────────────────────────
+# Tries the 'slot' argument first (v4), then 'layer' (v5).
+get_data <- function(obj, assay = NULL, slot = "data") {
+  if (is.null(assay)) assay <- DefaultAssay(obj)
+  if (!assay %in% names(obj@assays)) return(NULL)
+  out <- tryCatch(
+    GetAssayData(obj, assay = assay, slot  = slot),
+    error = function(e) NULL
+  )
+  if (is.null(out))
+    out <- tryCatch(
+      GetAssayData(obj, assay = assay, layer = slot),
+      error = function(e) NULL
+    )
+  out
+}
+
+# ── Metadata helpers ──────────────────────────────────────────────────────────
+
+meta_with_cell <- function(obj) {
+  obj@meta.data |> tibble::rownames_to_column("cell")
+}
+
+read_contig <- function(path) {
+  config <- stringr::str_extract(path, "multi_config_[0-9]+")
+  df     <- readr::read_csv(path, show_col_types = FALSE)
+  df$config <- config
+  df
+}
+
+pbmc_configs <- paste0("multi_config_", 1:5)
+
+# Add a column to Seurat metadata from a named vector / lookup data.frame.
+# 'key_col' is the matching column in 'lookup'; 'value_col' is what to pull.
+add_meta_from_lookup <- function(obj, lookup, key_col, value_col,
+                                  new_col = value_col) {
+  idx <- match(colnames(obj), lookup[[key_col]])
+  obj@meta.data[[new_col]] <- lookup[[value_col]][idx]
+  obj
+}
+
+# ── ADT feature-name matching ─────────────────────────────────────────────────
+# Uses exact word-boundary anchoring to avoid DV1 matching DV10, etc.
+find_adt_features <- function(patterns, feature_names) {
+  unique(unlist(lapply(patterns, function(p) {
+    grep(p, feature_names, value = TRUE, ignore.case = TRUE, perl = TRUE)
+  })))
+}
+
+# ── VDJ barcode normalisation ─────────────────────────────────────────────────
+# Strips the trailing GEM-group suffix (-1, -2, …) and prepends the config tag
+# so barcodes match the Seurat cell names built during object creation.
+normalise_vdj_barcode <- function(barcode, config_tag) {
+  core <- sub("-[0-9]+$", "", barcode)
+  paste0(config_tag, "_", core, "-1")
+}
+```
+
+## Donor reference table
+
+```{r}
+#| label: donor-table
+
+donor_info <- data.frame(
+  subject   = c("14764","14765","14766","14767","14768","14769","14770"),
+  timepoint = c("MD041 pre","MD012 d9","MD028 d9","MD032 d9",
+                "MD023 d15","MD026 d15","CHI-17 control"),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(donor_info, caption = "Seven donors with timepoint labels")
+```
+
+## Load saved RDS objects
+
+QC, doublet removal, clustering, and Monaco immune-cell annotation were
+performed upstream and serialised as `.rds` files. Loading them here keeps the
+report reproducible without re-running the full pipeline.
+
+```{r}
+#| label: load-rds
+
+pbmc_filt <- readRDS(require_file(
+  "PBMC_5lanes_singlets_filtered_Monaco_annotated.rds"))
+
+ag_filt   <- readRDS(require_file(
+  "AG_singlets_filtered_Monaco_DV_annotated.rds"))
+
+# B-cell subset objects — loaded if already saved, otherwise built in Q5
+pbmc_bcell_rds <- "PBMC_5lanes_Bcell_only_Monaco.rds"
+ag_bcell_rds   <- "AG_Bcell_only_Monaco_demux.rds"
+
+pbmc_bcell_obj <- if (file.exists(pbmc_bcell_rds)) readRDS(pbmc_bcell_rds) else NULL
+ag_bcell_obj   <- if (file.exists(ag_bcell_rds))   readRDS(ag_bcell_rds)   else NULL
+
+pbmc_merged <- readRDS("PBMC_5lanes_merged_with_demux.rds")
+
+```
+
+---
+
+# Q0 · QC and Donor Demultiplexing {#q0}
+
+**Goal:** Confirm that the upstream QC pipeline produced high-quality singlets
+for all seven donors in both the PBMC (lanes 1–5) and antigen-sort (lanes 6–7)
+captures. This section reports per-lane QC metrics and verifies that Monaco
+annotation correctly assigned cells to their donor of origin.
+
+Donor demultiplexing was performed upstream using genotype-based assignment methods (e.g., Vireo, demuxlet, or cellSNP-lite) with bulk RNA-seq reference data. The resulting Seurat object contains donor assignments stored in the subject metadata field, and only cells classified as Singletons were retained for downstream analysis.
+
+To remove low-quality cells, PBMCs were filtered using the following criteria:
+
+Assigned to a single donor (SNP_call == "Singleton")
+Greater than 200 detected genes (nFeature_RNA > 200)
+Less than 10% mitochondrial transcripts (percent_mito < 10)
+
+The filtering step was implemented as:
+
+pbmc_filt <- subset(
+  pbmc_merged,
+  subset =
+    SNP_call == "Singleton" &
+    nFeature_RNA > 200 &
+    percent_mito < 10
+)
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Background
+
+Donor demultiplexing was performed upstream using a bulk RNA-seq reference with
+**Vireo** (or an equivalent reference-based deconvolution tool such as
+demuxlet / cellSNP-lite). The `.rds` objects loaded above already contain
+singlet-only cells with a `subject` metadata column reflecting the assigned
+donor. This section validates that assignment rather than re-running
+demultiplexing.
+  pbmc_merged,
+  subset = SNP_call == "Singleton" &
+    nFeature_RNA > 200 &
+    percent_mito < 10
+:::
+
+## 0a — Per-lane cell counts after QC and doublet removal
+
+## Donor Demultiplexing QC
+
+![UpSet plot showing donor assignment and singlet recovery after genotype-based demultiplexing.](multi_config_1_combined_DemuxOnly_Singlets_upset_donor_assignment.png){fig-align="center" width="80%"}
+
+```{r}
+#| label: q0-qc-summary
+
+qc_cols_of_interest <- c("nFeature_RNA", "nCount_RNA", "percent.mt",
+                          "subject", "doublet_score", "doublet_class")
+qc_cols_present <- intersect(qc_cols_of_interest,
+                              colnames(pbmc_filt@meta.data))
+
+qc_meta <- pbmc_filt@meta.data[, qc_cols_present, drop = FALSE] |>
+  tibble::rownames_to_column("cell")
+
+# Per-subject cell counts
+subject_counts <- qc_meta |>
+  dplyr::count(subject, name = "n_cells_after_QC") |>
+  dplyr::left_join(donor_info, by = "subject")
+
+knitr::kable(subject_counts,
+             caption = "Cells retained per donor after QC + doublet removal (PBMC)")
+readr::write_csv(subject_counts,
+                 "PBMC_figures/Q0_cells_per_subject_after_QC.csv")
+```
+
+## 0b — QC metric distributions per subject
+
+Violin plots of nFeature_RNA, nCount_RNA and mitochondrial percentage per
+donor help flag any sample with unusual quality.
+
+```{r}
+#| label: q0-qc-violin
+#| fig-width: 14
+#| fig-height: 10
+
+qc_metrics_available <- intersect(
+  c("nFeature_RNA", "nCount_RNA", "percent_mito","percent_ribo","percent_hb","nCount_ADT","nFeature_ADT" ),
+  colnames(pbmc_filt@meta.data)
+)
+
+if (length(qc_metrics_available) > 0) {
+  p_q0_qc <- VlnPlot(
+    pbmc_filt,
+    features = qc_metrics_available,
+    group.by = "subject",
+    pt.size  = 0,
+    ncol     = length(qc_metrics_available)
+  ) &
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+ 
+}
+ print(p_q0_qc)
+  save_plot(p_q0_qc,
+            "PBMC_figures/Q0_QC_metrics_per_subject_violin.png",
+            width = 14, height = 10)
+  
+ v_cells_qc<- VlnPlot(
+    pbmc_filt,
+    features = c(
+        "nFeature_RNA",
+        "nCount_RNA",
+        "percent_mito",
+        "percent_hb"
+    ),
+    group.by = "monaco_main",
+    pt.size = 0
+)
+ 
+  print( v_cells_qc) 
+  
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+Comparable distributions of nFeature_RNA and nCount_RNA across donors indicate
+consistent library complexity. Elevated mitochondrial percentage can signal
+poor-quality or dying cells; the upstream QC filter should have removed the
+worst offenders. Donor-specific outliers here should be noted when interpreting
+downstream results.
+:::
+
+## 0c — Batching confidence: UMAP coloured by Lane
+
+```{r}
+#| label: q0-demux-umap
+#| fig-width: 10
+#| fig-height: 6
+
+p_q0_subject <- DimPlot(
+  pbmc_filt,
+  group.by = "Lane",
+  label    = FALSE,
+  pt.size  = 0.4
+) + ggtitle("Q0: PBMC UMAP coloured by lane (demultiplexed)")
+
+p_q0_subject
+save_plot(p_q0_subject,
+          "PBMC_figures/Q0_PBMC_UMAP_by_subject.png",
+          width = 10, height = 6)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+If lanes are well mixed across all major clusters then this is
+consistent with biology rather than technical batch effects.
+:::
+
+---
+
+# Q1 · PBMC Cell Populations per Subject (GEX + ADT) {#q1}
+
+**Goal:** Identify which immune cell types are present in each donor's PBMC
+sample by combining transcriptome-based Monaco annotation with CITE-seq surface
+protein measurements.
+
+## 1a — UMAP coloured by Monaco annotation (all donors combined)
+
+```{r}
+#| label: q1-umap-combined
+#| fig-width: 16
+#| fig-height: 8
+
+DefaultAssay(pbmc_filt) <- "RNA"
+
+p_q1_umap_main <- DimPlot(
+  pbmc_filt,
+  group.by = "monaco_main",
+  label    = TRUE,
+  repel    = TRUE
+) + ggtitle("Q1: PBMC populations — Monaco main") +
+  theme(legend.text = element_text(size = 7))
+
+p_q1_umap_fine <- DimPlot(
+  pbmc_filt,
+  group.by = "monaco_fine",
+  label    = TRUE,
+  repel    = TRUE
+) + ggtitle("Q1: PBMC populations — Monaco fine") +
+  theme(legend.text = element_text(size = 7))
+
+p_q1_combined <- (p_q1_umap_main + p_q1_umap_fine) +
+  patchwork::plot_layout(ncol = 2, guides = "collect")
+
+p_q1_combined
+save_plot(p_q1_combined,
+          "PBMC_figures/Q1_PBMC_UMAP_Monaco_combined.png",
+          width = 16, height = 8)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+This UMAP is a quality-control and orientation figure. Clean separation of
+major populations (T cells, B cells, NK cells, monocytes, dendritic cells)
+confirms that GEX clustering and Monaco reference annotation worked as expected.
+The fine annotation panel shows additional immune subtypes within each broad
+lineage.
+:::
+
+## 1b — UMAP split by subject
+
+Each panel shows one donor; cells are coloured by Monaco main annotation.
+
+```{r}
+#| label: q1-umap-split
+#| fig-width: 20
+#| fig-height: 10
+
+p_q1_umap_subject <- DimPlot(
+  pbmc_filt,
+  group.by = "monaco_main",
+  split.by = "subject",
+  label    = FALSE,
+  pt.size  = 1,
+  ncol     = 4
+) + ggtitle("Q1: PBMC cell populations per subject")
+
+p_q1_umap_subject
+save_plot(p_q1_umap_subject,
+          "PBMC_figures/Q1_PBMC_celltypes_per_subject_UMAP.png",
+          width = 20, height = 10)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+This split UMAP shows how each donor contributes to the shared PBMC cell-state
+map. Similar cluster structure across donors indicates the samples are broadly
+comparable after preprocessing. Donor-specific enrichment in certain regions
+reflects biological variation (infection/vaccination timepoint, immune
+activation state) rather than technical artefact.
+:::
+
+## 1c — Stacked bar: cell-type proportion per subject
+
+```{r}
+#| label: q1-bar
+#| fig-height: 6
+
+celltype_freq <- pbmc_filt@meta.data |>
+  dplyr::count(subject, monaco_fine) |>
+  dplyr::group_by(subject) |>
+  dplyr::mutate(percent = n / sum(n) * 100) |>
+  dplyr::ungroup() |>
+  dplyr::left_join(donor_info, by = "subject") |>
+  dplyr::mutate(subject_label = paste0(subject, "\n", timepoint))
+
+p_q1_bar <- ggplot(celltype_freq,
+                   aes(x = subject_label, y = percent, fill = monaco_fine)) +
+  geom_bar(stat = "identity", colour = "black", linewidth = 0.2) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = "Q1: PBMC cell-type composition per subject",
+       x = NULL, y = "% of cells", fill = "Cell type") +
+  theme_classic() +
+  theme(axis.text.x     = element_text(angle = 45, hjust = 1, size = 9),
+        legend.key.size = unit(0.4, "cm"),
+        legend.text     = element_text(size = 7))
+
+p_q1_bar
+save_plot(p_q1_bar,
+          "PBMC_figures/Q1_PBMC_celltype_composition_per_subject.png",
+          width = 14, height = 6)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+Compositional differences across donors may reflect biology (e.g., elevated
+monocyte frequency at day 9 of infection), differences in total cell recovery,
+or donor-to-donor immune variation. This figure provides essential context for
+later antigen-specific and BCR analyses, where B-cell abundance per donor
+influences downstream signal.
+:::
+
+## 1d — ADT validation of GEX-defined cell types
+
+Dot plots show surface protein expression (CITE-seq ADT) averaged per Monaco
+cell type. Concordance between expected markers and their cognate cell types
+(e.g. CD19 on B cells, CD14 on monocytes) validates GEX-based annotation.
+
+```{r}
+#| label: q1-adt
+#| fig-width: 12
+#| fig-height: 7
+
+if ("ADT" %in% names(pbmc_filt@assays)) {
+
+  DefaultAssay(pbmc_filt) <- "ADT"
+
+  # Remove cells with missing or blank annotation before plotting
+  pbmc_adt_plot <- subset(
+    pbmc_filt,
+    subset = !is.na(monaco_main) & monaco_main != ""
+  )
+
+  adt_marker_panel <- c(
+    "Hu.CD3-UCHT1","Hu.CD4-RPA.T4","Hu.CD8","Hu.CD14-M5E2","Hu.CD16",
+    "Hu.CD19","Hu.CD20-2H7","Hu.CD56","Hu.HLA.DR","Hu.CD11c",
+    "Hu.CD123","Hu.CD27","Hu.IgD","Hu.IgM","Hu.CD38-HIT2"
+  )
+
+  adt_features_use <- intersect(adt_marker_panel,
+                                 rownames(pbmc_adt_plot[["ADT"]]))
+
+  if (length(adt_features_use) > 0) {
+
+    # Enforce a sensible factor order for the y-axis
+    pbmc_adt_plot$monaco_main <- factor(
+      pbmc_adt_plot$monaco_main,
+      levels = c("B cells","CD4+ T cells","CD8+ T cells","T cells",
+                 "NK cells","Monocytes","Dendritic cells",
+                 "Neutrophils","Basophils","Progenitors")
+    )
+
+    p_q1_adt_dot <- DotPlot(
+      pbmc_adt_plot,
+      assay    = "ADT",
+      features = adt_features_use,
+      group.by = "monaco_main",
+      scale    = TRUE
+    ) +
+      coord_flip() +
+      labs(title = "Q1d: ADT validation of GEX-defined PBMC cell populations",
+           x = "ADT surface marker", y = "Monaco cell type") +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+            axis.text.y = element_text(size = 9),
+            plot.title  = element_text(face = "bold"))
+
+    print(p_q1_adt_dot)
+    save_plot(p_q1_adt_dot,
+              "PBMC_figures/Q1d_PBMC_ADT_validation_by_Monaco_celltype.png",
+              width = 12, height = 7)
+  } else {
+    message("No expected ADT markers found in the object — check feature names.")
+  }
+
+  DefaultAssay(pbmc_filt) <- "RNA"
+}
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+Expected concordance: CD3/CD4/CD8 on T cells; CD14/CD16 on monocytes;
+CD19/CD20 on B cells; CD56 on NK cells; HLA-DR on antigen-presenting cells.
+Agreement between surface protein and transcript-based labels supports the
+reliability of Monaco annotations used throughout this report.
+:::
+
+## 1e — Cell count table per subject × cell type
+
+```{r}
+#| label: q1-table
+
+count_tbl <- pbmc_filt@meta.data |>
+  dplyr::count(subject, monaco_fine) |>
+  tidyr::pivot_wider(names_from  = monaco_fine,
+                     values_from = n,
+                     values_fill = 0)
+
+save_table(count_tbl,
+           "PBMC_figures/Q1_PBMC_celltype_counts_per_subject.csv")
+
+knitr::kable(count_tbl,
+             caption = "Absolute cell counts: subject × Monaco cell type")
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+Absolute counts complement the percentage barplot — a cell type may appear as
+a modest fraction but still provide enough cells for meaningful downstream
+analysis. Very low counts (< 10–20) in a specific cell type should temper
+interpretation of donor-specific results for that lineage.
+:::
+
+---
+
+# Q2 · DENV-Infected Cell Identification (GEX) {#q2}
+
+**Goal:** Detect cells containing dengue viral RNA by querying reads mapped to
+the DENV genome. This requires that the viral genome was appended to the
+Cell Ranger reference at the alignment step.
+
+::: {.callout-warning}
+## Action required before running this section
+
+Identify the exact DENV serotype / strain used for infection (or present in
+patient samples) and confirm that the corresponding NCBI accession was included
+in the Cell Ranger custom reference. The `denv_search_patterns` vector below
+must match the feature names that Cell Ranger generated from that accession.
+
+Common accessions: DENV-1 NC_001477, DENV-2 NC_001474, DENV-3 NC_001475,
+DENV-4 NC_002640.
+:::
+
+```{r}
+#| label: q2-search
+
+DefaultAssay(pbmc_filt) <- "RNA"
+
+# ── Edit these patterns to match your Cell Ranger feature names ───────────────
+denv_search_patterns <- c(
+  "^DENV", "^dengue", "^NC_001477", "^NC_001474",
+  "^NC_001475", "^NC_002640", "^KM204118", "^KX830960"
+)
+
+denv_genes <- grep(
+  paste(denv_search_patterns, collapse = "|"),
+  rownames(pbmc_filt),
+  value       = TRUE,
+  ignore.case = TRUE
+)
+
+denv_detected <- length(denv_genes) > 0
+
+message(
+  if (denv_detected)
+    paste("DENV genes found:", paste(denv_genes, collapse = ", "))
+  else
+    paste("No DENV genes matched. Patterns searched:",
+          paste(denv_search_patterns, collapse = " | "),
+          "\nAll feature names (first 20):",
+          paste(head(rownames(pbmc_filt), 20), collapse = ", "))
+)
+```
+
+```{r}
+#| label: q2-score
+#| eval: !expr denv_detected
+
+pbmc_filt <- PercentageFeatureSet(
+  pbmc_filt,
+  features = denv_genes,
+  col.name = "percent_DENV"
+)
+pbmc_filt$DENV_infected <- pbmc_filt$percent_DENV > 0
+
+denv_summary <- pbmc_filt@meta.data |>
+  dplyr::filter(DENV_infected) |>
+  dplyr::count(subject, monaco_fine, name = "DENV_cells") |>
+  dplyr::left_join(donor_info, by = "subject") |>
+  dplyr::arrange(dplyr::desc(DENV_cells))
+
+save_table(denv_summary,
+           "DENV_figures/Q2_DENV_infected_cells_summary.csv")
+knitr::kable(denv_summary,
+             caption = "DENV+ cells by subject and cell type")
+```
+
+
+## VDJ-GEX Integration QC
+
+```{r}
+#| label: q3-vdj-gex-qc
+
+library(dplyr)
+library(tibble)
+
+bcr_raw <- purrr::map_dfr(vdj_b_files, read_contig)
+
+bcr_raw <- bcr_raw |>
+  dplyr::filter(config %in% pbmc_configs) |>
+  dplyr::mutate(
+    # Strip trailing GEM-group suffix, then prepend the config tag to match
+    # the cell name format used when building the Seurat object.
+    cell = normalise_vdj_barcode(barcode, config),
+    mapped_to_pbmc = cell %in% colnames(pbmc_filt)
+  )
+
+# All unmapped VDJ contigs
+na_contigs <- bcr_raw %>%
+  filter(!mapped_to_pbmc)
+
+# Unique unmapped cells
+na_unique <- na_contigs %>%
+  distinct(config, barcode, cell)
+
+cat("Total unmapped VDJ contigs:", nrow(na_contigs), "\n")
+cat("Unique unmapped VDJ cells:", nrow(na_unique), "\n")
+```
+
+### Why were these cells removed?
+
+```{r}
+#| label: q3-vdj-gex-filter-reasons
+
+unmapped_meta <- pbmc_merged@meta.data[
+  na_unique$cell[na_unique$cell %in% colnames(pbmc_merged)],
+  ,
+  drop = FALSE
+] %>%
+  rownames_to_column("cell") %>%
+  as_tibble()
+
+# SNP assignment
+unmapped_meta %>%
+  dplyr::count(SNP_call, sort = TRUE) %>%
+  knitr::kable(
+    caption = "SNP assignments for unmapped VDJ cells"
+  )
+```
+
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+barcode	chain	contig
+AAACCGTGTGGTTGGC-1	IGH	heavy chain
+AAACCGTGTGGTTGGC-1	IGK	light chain
+AAACCGTGTGGTTGGC-1	IGK	second light-chain contig
+AAACCGTGTGGTTGGC-1	IGH	non-productive heavy
+:::
+
+### QC metrics of unmapped singleton cells
+
+```{r}
+#| label: q3-vdj-gex-singleton-qc
+
+unmapped_singletons <- unmapped_meta %>%
+  filter(SNP_call == "Singleton")
+
+cat("Singleton cells not mapped to PBMC object:",
+    nrow(unmapped_singletons), "\n")
+
+unmapped_singletons %>%
+  summarise(
+    n_cells = n(),
+    low_features = sum(nFeature_RNA <= 200, na.rm = TRUE),
+    high_mito = sum(percent_mito >= 10, na.rm = TRUE),
+    median_features = median(nFeature_RNA, na.rm = TRUE),
+    median_counts = median(nCount_RNA, na.rm = TRUE),
+    median_mito = median(percent_mito, na.rm = TRUE)
+  ) %>%
+  knitr::kable(
+    caption = "QC metrics for unmapped singleton cells"
+  )
+```
+
+### Combined filtering reasons
+
+```{r}
+#| label: q3-vdj-gex-filter-summary
+
+unmapped_meta %>%
+  mutate(
+    fail_snp = SNP_call != "Singleton" | is.na(SNP_call),
+    fail_features = nFeature_RNA <= 200,
+    fail_mito = percent_mito >= 10
+  ) %>%
+  dplyr::count(
+    fail_snp,
+    fail_features,
+    fail_mito,
+    sort = TRUE
+  ) %>%
+  knitr::kable(
+    caption = "Filtering combinations responsible for loss of VDJ-linked cells"
+  )
+```
+
+
+```{r}
+#| label: q2-barplot
+#| eval: !expr denv_detected
+#| fig-height: 5
+
+denv_per_sample <- pbmc_filt@meta.data |>
+  dplyr::count(subject, DENV_infected) |>
+  dplyr::group_by(subject) |>
+  dplyr::mutate(total = sum(n), pct = n / total * 100) |>
+  dplyr::ungroup() |>
+  dplyr::filter(DENV_infected) |>
+  dplyr::left_join(donor_info, by = "subject") |>
+  dplyr::mutate(subject_label = paste0(subject, "\n", timepoint))
+
+p_q2_bar <- ggplot(denv_per_sample,
+                   aes(x = subject_label, y = n, fill = subject)) +
+  geom_bar(stat = "identity", colour = "black") +
+  geom_text(aes(label = paste0(n, "\n(", round(pct, 2), "%)")),
+            vjust = -0.3, size = 3) +
+  labs(title = "Q2: DENV-infected cells per subject",
+       x = NULL, y = "Number of DENV+ cells") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_q2_bar
+save_plot(p_q2_bar,
+          "DENV_figures/Q2_DENV_infected_cells_per_subject.png",
+          width = 8, height = 5)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+Higher counts may indicate stronger viral RNA detection, but must be
+interpreted cautiously: ambient RNA carry-over and low-level cross-mapping can
+produce spurious positives, especially when viral load is low. Compare DENV+
+counts to the cell-type composition in Q1 to determine whether a particular
+lineage is enriched.
+:::
+
+```{r}
+#| label: q2-umap
+#| eval: !expr denv_detected
+#| fig-height: 6
+
+p_q2_umap <- DimPlot(
+  pbmc_filt,
+  group.by = "DENV_infected",
+  cols     = c("FALSE" = "grey85", "TRUE" = "firebrick"),
+  order    = TRUE
+) + ggtitle("Q2: DENV RNA-positive cells on PBMC UMAP") +
+  labs(colour = "DENV+")
+
+p_q2_umap
+save_plot(p_q2_umap,
+          "DENV_figures/Q2_DENV_infected_UMAP.png",
+          width = 7, height = 6)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+Enrichment of DENV+ cells in a specific immune cluster (e.g., monocytes)
+suggests lineage-preferential viral RNA detection. A scattered rare-positive
+pattern across many clusters is less convincing and may require additional
+validation (e.g., confirmation by ISH or bulk qRT-PCR).
+:::
+
+```{r}
+#| label: q2-vln
+#| eval: !expr (denv_detected && length(denv_genes) <= 6)
+#| fig-width: 14
+#| fig-height: 6
+
+pbmc_denv_subset <- subset(pbmc_filt, subset = DENV_infected == TRUE)
+if (ncol(pbmc_denv_subset) > 0) {
+  p_q2_vln <- VlnPlot(
+    pbmc_denv_subset,
+    features = denv_genes,
+    group.by = "monaco_fine",
+    pt.size  = 0.5,
+    ncol     = min(3, length(denv_genes))
+  ) + ggtitle("Q2: DENV gene expression in infected cells by cell type")
+
+  p_q2_vln
+  save_plot(p_q2_vln,
+            "DENV_figures/Q2_DENV_expression_in_infected_cells.png",
+            width = 14, height = 6)
+}
+```
+
+```{r}
+#| label: q2-not-detected
+#| eval: !expr isFALSE(denv_detected)
+
+writeLines(
+  c("No DENV genes detected in GEX matrix.",
+    "Possible reasons:",
+    "1. The DENV genome was not appended to the Cell Ranger reference.",
+    "2. Viral load was below the scRNA-seq detection threshold.",
+    "3. Feature names differ — inspect rownames(pbmc_filt) for any viral hits.",
+    paste("Patterns searched:",
+          paste(denv_search_patterns, collapse = " | "))),
+  "DENV_figures/Q2_DENV_not_detected_notes.txt"
+)
+message("No DENV genes found — see DENV_figures/Q2_DENV_not_detected_notes.txt")
+```
+
+---
+
+# Q3 · BCR Sequences per Subject (VDJ) {#q3}
+
+**Goal:** Use VDJ to demonstrate BCR sequences can be determined for B cells from each subject
+
+## Read and merge PBMC VDJ contig files (lanes 1–5)
+
+```{r}
+#| label: q3-load
+
+# Adjust the glob pattern to match your directory structure
+vdj_b_files <- Sys.glob("./DATA/multi_config_[1-5]_filtered_contig_annotations.csv")
+
+# Fallback: search recursively
+if (length(vdj_b_files) == 0)
+  vdj_b_files <- Sys.glob("./VDJ/*config_[1-5]*/filtered_contig_annotations.csv")
+
+message("Found VDJ B files (", length(vdj_b_files), "):\n  ",
+        paste(vdj_b_files, collapse = "\n  "))
+
+# Helper: read one contig file and tag with its config number
+read_contig <- function(path) {
+  config <- stringr::str_extract(path, "multi_config_[0-9]+")
+  df     <- readr::read_csv(path, show_col_types = FALSE)
+  df$config <- config
+  df
+}
+
+#bcr_raw <- purrr::map_dfr(vdj_b_files, read_contig)
+message("Total BCR contigs loaded: ", nrow(bcr_raw))
+```
+
+## Standardise barcodes and annotate with Seurat metadata
+
+```{r}
+#| label: q3-annotate
+
+# Only keep PBMC configs 1–5
+pbmc_configs <- paste0("multi_config_", 1:5)
+
+bcr_raw <- bcr_raw |>
+  dplyr::filter(config %in% pbmc_configs) |>
+  dplyr::mutate(
+    # Strip trailing GEM-group suffix, then prepend the config tag to match
+    # the cell name format used when building the Seurat object.
+    cell = normalise_vdj_barcode(barcode, config),
+    mapped_to_pbmc = cell %in% colnames(pbmc_filt)
+  )
+
+message("PBMC VDJ contig mapping rate:")
+print(bcr_raw |> dplyr::count(config, mapped_to_pbmc))
+
+# Pull a slim metadata table from the Seurat object
+meta_slim <- pbmc_filt@meta.data |>
+  dplyr::select(subject, monaco_main, monaco_fine, seurat_clusters) |>
+  tibble::rownames_to_column("cell")
+
+bcr_annotated <- bcr_raw |>
+  dplyr::left_join(meta_slim, by = "cell")
+
+message("Unmapped contigs after metadata join: ",
+        sum(is.na(bcr_annotated$subject)), " / ", nrow(bcr_annotated))
+```
+
+## Filter: productive, full-length, paired heavy + light chain
+
+```{r}
+#| label: q3-filter
+
+# Keep only productive, full-length contigs
+bcr_productive <- bcr_annotated |>
+  dplyr::filter(
+    productive %in% c("True", TRUE, "true"),
+    full_length %in% c("True", TRUE, "true")
+  )
+
+# Identify cells with at least one IGH AND one IGK/IGL
+paired_cells <- bcr_productive |>
+  dplyr::group_by(cell) |>
+  dplyr::summarise(
+    has_heavy = any(chain == "IGH"),
+    has_light = any(chain %in% c("IGK", "IGL")),
+    .groups   = "drop"
+  ) |>
+  dplyr::filter(has_heavy & has_light) |>
+  dplyr::pull(cell)
+
+bcr_paired <- bcr_productive |>
+  dplyr::filter(cell %in% paired_cells)
+
+message("Cells with paired productive BCR: ", length(unique(paired_cells)))
+message("VDJ cells not in pbmc_filt: ",
+        length(unique(bcr_paired$cell[is.na(bcr_paired$subject)])))
+```
+
+## 3a — BCR cell counts per subject
+
+```{r}
+#| label: q3-counts
+#| fig-height: 5
+
+bcr_per_subject <- bcr_paired |>
+  dplyr::filter(!is.na(subject), chain == "IGH") |>
+  dplyr::distinct(cell, subject) |>
+  dplyr::count(subject, name = "BCR_cells") |>
+  dplyr::left_join(donor_info, by = "subject")
+
+save_table(bcr_per_subject,
+           "VDJ_figures/Q3_BCR_cells_per_subject.csv")
+knitr::kable(bcr_per_subject,
+             caption = "Paired BCR-sequenced B cells per subject (PBMC, lanes 1–5)")
+
+p_q3_count <- ggplot(
+  bcr_per_subject,
+  aes(x = paste0(subject, "\n", timepoint), y = BCR_cells, fill = subject)
+) +
+  geom_bar(stat = "identity", colour = "black") +
+  geom_text(aes(label = BCR_cells), vjust = -0.3, size = 3.5) +
+  labs(title = "Q3: BCR-sequenced B cells per subject (PBMC)",
+       x = NULL, y = "Cells with paired BCR") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_q3_count
+save_plot(p_q3_count,
+          "VDJ_figures/Q3_BCR_cells_per_subject_barplot.png",
+          width = 8, height = 5)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+Differences in paired BCR recovery across donors reflect B-cell abundance,
+sequencing depth, and VDJ library quality. Cells that did not map back to
+`pbmc_filt` (printed above) were excluded because they cannot be linked to a
+GEX-validated cell type or donor identity.
+:::
+
+## 3b — Paired BCR cells on UMAP
+
+```{r}
+#| label: q3-umap
+#| fig-width: 8
+#| fig-height: 6
+
+pbmc_filt$BCR_paired <- ifelse(
+  colnames(pbmc_filt) %in% unique(bcr_paired$cell),
+  "Paired_BCR", "No_BCR"
+)
+
+p_q3_umap <- DimPlot(
+  pbmc_filt,
+  group.by = "BCR_paired",
+  cols     = c("No_BCR" = "grey85", "Paired_BCR" = "red"),
+  order    = TRUE
+) + ggtitle("Q3b: Paired BCR-sequenced cells on PBMC UMAP")
+
+p_q3_umap
+save_plot(p_q3_umap,
+          "VDJ_figures/Q3b_Paired_BCR_cells_UMAP.png",
+          width = 8, height = 6)
+
+
+pbmc_filt@meta.data %>%
+   dplyr::filter(BCR_paired == "Paired_BCR") %>%
+   dplyr::count(monaco_main) %>%
+   dplyr::mutate(percent = round(100 * n / sum(n), 2))
+
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Interpretation
+
+Most paired BCR cells should localise to GEX-defined B-cell clusters. Cells
+with paired BCR that fall outside B-cell regions may reflect imperfect
+annotation or rare off-target captures and should be treated cautiously in
+clonotype analysis.
+:::
+
+
+
+---
+
+# Session Info
+
+```{r}
+#| label: session-info
+
+writeLines(capture.output(sessionInfo()), "session_info.txt")
+sessionInfo()
+```
